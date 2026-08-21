@@ -39,6 +39,31 @@ var Registry = []Module{
 	{Name: "xss", Desc: "reflected xss scan on discovered parameters", NeedsTarget: true, Run: scanner.XSSDetect},
 	{Name: "subenum", Desc: "subdomain brute-force via dns", NeedsTarget: true, Run: scanner.SubEnum},
 	{Name: "dns", Desc: "gather dns records (a/mx/ns/txt/cname)", NeedsTarget: true, Run: scanner.DNSInfo},
+	{Name: "waf", Desc: "detect waf presence (cloudflare, imperva, etc.)", NeedsTarget: true, Run: scanner.WAFDetect},
+	{Name: "cdn", Desc: "detect cdn (cloudflare, akamai, fastly, etc.)", NeedsTarget: true, Run: scanner.CDNDetect},
+	{Name: "cors", Desc: "check cors misconfigurations", NeedsTarget: true, Run: scanner.CORSCheck},
+	{Name: "redirect", Desc: "open redirect detection", NeedsTarget: true, Run: scanner.OpenRedirect},
+	{Name: "hostheader", Desc: "host header injection test", NeedsTarget: true, Run: scanner.HostHeaderInjection},
+	{Name: "lfi", Desc: "local file inclusion probes", NeedsTarget: true, Run: scanner.LFIProbe},
+	{Name: "cmdi", Desc: "command injection probes", NeedsTarget: true, Run: scanner.CMDIProbe},
+	{Name: "csrf", Desc: "csrf token analysis", NeedsTarget: true, Run: scanner.CSRFCheck},
+	{Name: "ratelimit", Desc: "rate limiting test", NeedsTarget: true, Run: scanner.RateLimitTest},
+	{Name: "ssl", Desc: "comprehensive ssl/tls audit", NeedsTarget: true, Run: scanner.SSLComprehensive},
+	{Name: "git", Desc: "exposed .git directory check", NeedsTarget: true, Run: scanner.GitExposure},
+	{Name: "dotenv", Desc: "exposed .env file check", NeedsTarget: true, Run: scanner.DotEnvExposure},
+	{Name: "robots", Desc: "robots.txt analysis", NeedsTarget: true, Run: scanner.RobotsAnalysis},
+	{Name: "sitemap", Desc: "sitemap.xml analysis", NeedsTarget: true, Run: scanner.SitemapAnalysis},
+	{Name: "wp", Desc: "wordpress enumeration", NeedsTarget: true, Run: scanner.WPEnum},
+	{Name: "js", Desc: "javascript secret/endpoint scan", NeedsTarget: true, Run: scanner.JSSecrets},
+	{Name: "banners", Desc: "service banner grabbing", NeedsTarget: true, Run: scanner.BannerGrab},
+	{Name: "vulns", Desc: "cve/version matching", NeedsTarget: true, Run: scanner.CVEMatch},
+	{Name: "dirlist", Desc: "directory listing detection", NeedsTarget: true, Run: scanner.DirListDetect},
+	{Name: "backup", Desc: "backup file hunting", NeedsTarget: true, Run: scanner.BackupHunt},
+	{Name: "email", Desc: "email harvesting", NeedsTarget: true, Run: scanner.EmailHarvest},
+	{Name: "wayback", Desc: "wayback machine url enumeration", NeedsTarget: true, Run: scanner.WaybackURLs},
+	{Name: "graphql", Desc: "graphql introspection query", NeedsTarget: true, Run: scanner.GraphQLIntrospection},
+	{Name: "api", Desc: "api endpoint fuzzing", NeedsTarget: true, Run: scanner.APIFuzz},
+	{Name: "http2", Desc: "http/2 support check", NeedsTarget: true, Run: scanner.HTTP2Check},
 	{Name: "shell", Desc: "run bundled bash helpers (recon_all, nmap_quick, ssl_check)", NeedsTarget: true, Run: shellRun},
 	{Name: "about", Desc: "show hacklith banner and usage", NeedsTarget: false, Run: aboutRun},
 }
@@ -95,7 +120,7 @@ func shellRun(ctx context.Context, target string, opts Options, emit scanner.Emi
 
 func aboutRun(ctx context.Context, _ string, _ Options, emit scanner.Emit) error {
 	emit(scanner.LHl, "HACKLITH — offensive web testing toolkit (Go + bash, no python)")
-	emit(scanner.LInfo, "modules: probe, headers, cookies, methods, tech, portscan, dirb, admin, login, sqli, xss, subenum, dns, shell, about")
+	emit(scanner.LInfo, "modules: probe, headers, cookies, methods, tech, portscan, dirb, admin, login, sqli, xss, subenum, dns, waf, cdn, cors, redirect, hostheader, lfi, cmdi, csrf, ratelimit, ssl, git, dotenv, robots, sitemap, wp, js, banners, vulns, dirlist, backup, email, wayback, graphql, api, http2, shell, about")
 	emit(scanner.LInfo, "usage:  hacklith.sh --run <module> --target <url> [--ports spec] [--wordlist file]")
 	emit(scanner.LInfo, "        hacklith.sh                (interactive terminal UI)")
 	emit(scanner.LInfo, "each module emits tagged lines: [*] info  [+] ok  [!] warn  [x] crit  [~] dim  [>] highlight")

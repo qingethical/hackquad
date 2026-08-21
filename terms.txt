@@ -1,0 +1,48 @@
+HACKLITH TERMS OF USE / LIABILITY DISCLAIMER
+
+BY DOWNLOADING, INSTALLING, COMPILING, OR USING HACKLITH ("THE TOOL"),
+YOU AGREE TO THE FOLLOWING:
+
+1. AUTHORIZED USE ONLY
+   This tool is provided for legitimate security testing, penetration
+   testing, bug bounty programs, and educational purposes ONLY. You may
+   only use this tool on systems you own, have explicit written permission
+   to test, or are otherwise legally authorized to assess.
+
+2. YOU ARE RESPONSIBLE
+   When you run `sudo bash hacklith.sh`, you are executing a digital copy
+   of the source code that you have compiled into a tool using Go. We are
+   merely the provider of the source code. You are solely responsible for
+   your actions and any consequences that result from using this tool.
+
+3. NO LIABILITY
+   The authors, contributors, and distributors of HACKLITH shall not be
+   held liable for any damages, losses, data breaches, service
+   interruptions, legal actions, or other consequences arising from the
+   use or misuse of this tool. Use at your own risk.
+
+4. NO WARRANTY
+   This tool is provided "AS IS" without warranty of any kind, express
+   or implied, including but not limited to merchantability, fitness for
+   a particular purpose, or non-infringement.
+
+5. COMPLIANCE
+   You agree to comply with all applicable local, state, national, and
+   international laws and regulations. Unauthorized access to computer
+   systems is illegal.
+
+6. SOURCE CODE
+   HACKLITH is distributed as source code. You compile and run the
+   resulting binary at your own discretion and risk. The act of compiling
+   source code into an executable does not transfer any liability from
+   the source provider to you.
+
+7. MODIFICATION
+   If you modify, redistribute, or create derivative works from this
+   source code, you agree to include this disclaimer and assume full
+   responsibility for your modifications.
+
+BY USING HACKLITH, YOU ACKNOWLEDGE THAT YOU HAVE READ THIS DISCLAIMER,
+UNDERSTAND IT, AND AGREE TO BE BOUND BY ITS TERMS.
+
+IF YOU DO NOT AGREE, DO NOT DOWNLOAD, INSTALL, COMPILE, OR USE THIS TOOL.

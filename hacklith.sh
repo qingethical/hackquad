@@ -18,8 +18,20 @@ export HACKLITH_ROOT="$ROOT"
 BIN="$ROOT/build/hacklith"
 SRC="$ROOT/main.go"
 MODULES_DIR="$ROOT/modules/shell"
+INIT_DONE="$ROOT/.init_done"
 
-# --- dependency check ---------------------------------------------------
+# --- first-run init -------------------------------------------------------
+if [ ! -f "$INIT_DONE" ]; then
+  echo "[*] first run detected — running init.sh"
+  if [ -x "$ROOT/init.sh" ]; then
+    bash "$ROOT/init.sh"
+  else
+    echo "[x] init.sh not found at $ROOT/init.sh"
+    exit 1
+  fi
+fi
+
+# --- dependency check -----------------------------------------------------
 need_go=0
 if ! command -v go >/dev/null 2>&1; then
   need_go=1
@@ -54,6 +66,12 @@ if [ "${#missing[@]}" -gt 0 ]; then
   echo "    (apt install ${missing[*]})  — core modules work without them"
 fi
 
+# --- dependency sync (for bubbletea and other go modules) ------------------
+if [ -f "$ROOT/go.mod" ]; then
+  echo "[*] syncing go modules..."
+  (cd "$ROOT" && go mod tidy)
+fi
+
 # --- stale-source rebuild ------------------------------------------------
 need_build=0
 if [ ! -x "$BIN" ]; then
@@ -82,4 +100,3 @@ fi
 
 # --- run ------------------------------------------------------------------
 exec "$BIN" "$@"
-

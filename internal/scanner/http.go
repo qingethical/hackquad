@@ -148,6 +148,10 @@ func HeadersAudit(ctx context.Context, target string, _ Options, emit Emit) erro
 		{"Referrer-Policy", "controls referrer leakage"},
 		{"Permissions-Policy", "limits browser feature access"},
 		{"X-XSS-Protection", "legacy XSS filter"},
+		{"Cross-Origin-Embedder-Policy", "prevents cross-origin embedding (missing = COEP risk)"},
+		{"Cross-Origin-Opener-Policy", "prevents cross-origin window access (missing = COOP risk)"},
+		{"Cross-Origin-Resource-Policy", "prevents cross-origin resource sharing (missing = CORP risk)"},
+		{"X-Permitted-Cross-Domain-Policies", "restricts Flash cross-domain (missing = legacy risk)"},
 	}
 	for _, h := range required {
 		if v := r.Header.Get(h.name); v != "" {
@@ -161,6 +165,31 @@ func HeadersAudit(ctx context.Context, target string, _ Options, emit Emit) erro
 	}
 	if via := r.Header.Get("Via"); via != "" {
 		emit(LInfo, "via: "+via)
+	}
+	if cc := r.Header.Get("Cache-Control"); cc != "" {
+		emit(LInfo, "cache-control: "+cc)
+		if strings.Contains(strings.ToLower(cc), "no-store") || strings.Contains(strings.ToLower(cc), "no-cache") {
+			emit(LHl, "cache-control has no-store/no-cache (good for sensitive data)")
+		}
+	}
+	if pragma := r.Header.Get("Pragma"); pragma != "" {
+		emit(LInfo, "pragma: "+pragma)
+	}
+	if hsts := r.Header.Get("Strict-Transport-Security"); hsts != "" {
+		if !strings.Contains(strings.ToLower(hsts), "max-age") {
+			emit(LWarn, "hsts missing max-age")
+		}
+		if !strings.Contains(strings.ToLower(hsts), "includesubdomains") && !strings.Contains(strings.ToLower(hsts), "includeSubDomains") {
+			emit(LWarn, "hsts missing includeSubDomains")
+		}
+	}
+	if csp := r.Header.Get("Content-Security-Policy"); csp != "" {
+		if strings.Contains(strings.ToLower(csp), "unsafe-inline") || strings.Contains(strings.ToLower(csp), "unsafe-eval") {
+			emit(LWarn, "csp contains unsafe-inline or unsafe-eval (weakens xss protection)")
+		}
+		if strings.Contains(strings.ToLower(csp), "*") && strings.Contains(strings.ToLower(csp), "script-src") {
+			emit(LWarn, "csp script-src contains wildcard")
+		}
 	}
 	return nil
 }

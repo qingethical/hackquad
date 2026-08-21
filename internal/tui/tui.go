@@ -1,39 +1,59 @@
-// Package tui is the interactive hacklith interface: a raw-mode
-// terminal UI with a module panel, a streaming output panel and a
-// target input bar. Stdlib only — termios via syscall, ANSI escapes
-// for everything else.
 package tui
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
-	"unsafe"
 
+	"github.com/charmbracelet/bubbles/textinput"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/qingethical/hacklith/internal/cli"
 	"github.com/qingethical/hacklith/internal/modules"
 	"github.com/qingethical/hacklith/internal/scanner"
+	tea "github.com/charmbracelet/bubbletea"
 )
 
-const (
-	altOn   = "\x1b[?1049h"
-	altOff  = "\x1b[?1049l"
-	hideCur = "\x1b[?25l"
-	showCur = "\x1b[?25h"
-	home    = "\x1b[H"
-	cls     = "\x1b[2J"
-	rev     = "\x1b[7m"
+var (
+	bannerLines []string
+	bannerOnce  sync.Once
+)
 
-	// Arrow keys decode to private-use runes so they can never collide
-	// with printable input typed into the target bar.
-	keyUp    = rune(0xE000)
-	keyDown  = rune(0xE001)
-	keyRight = rune(0xE002)
-	keyLeft  = rune(0xE003)
+func getBanner() []string {
+	bannerOnce.Do(func() {
+		paths := []string{}
+		if root := os.Getenv("HACKLITH_ROOT"); root != "" {
+			paths = append(paths, filepath.Join(root, "internal", "assets", "banner.txt"))
+		}
+		if exe, err := os.Executable(); err == nil {
+			paths = append(paths, filepath.Join(filepath.Dir(exe), "..", "internal", "assets", "banner.txt"))
+			paths = append(paths, filepath.Join(filepath.Dir(exe), "internal", "assets", "banner.txt"))
+		}
+		paths = append(paths, "internal/assets/banner.txt")
+		paths = append(paths, "banner.txt")
+
+		for _, p := range paths {
+			if data, err := os.ReadFile(p); err == nil {
+				bannerLines = strings.Split(string(data), "\n")
+				break
+			}
+		}
+		if len(bannerLines) == 0 {
+			bannerLines = []string{"HACKLITH"}
+		}
+	})
+	return bannerLines
+}
+
+var (
+	moduleStyle   = lipgloss.NewStyle().PaddingLeft(1)
+	selectedStyle = lipgloss.NewStyle().PaddingLeft(1).Background(lipgloss.Color("62")).Foreground(lipgloss.Color("230"))
+	targetStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("86"))
+	statusStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("241")).PaddingLeft(1)
+	bannerStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("46")).Bold(true)
 )
 
 type line struct {
@@ -41,431 +61,342 @@ type line struct {
 	msg string
 }
 
-type TUI struct {
-	mu       sync.Mutex
-	lines    []line
-	last     []string // rendered lines of output panel (for save)
-	rendered bool
+type moduleItem struct {
+	name string
+	desc string
+}
 
-	sel      int
-	panel    int // 0 modules, 1 output, 2 target
-	target   string
-	curPos   int
-	scrl     int
-	help     bool
-	running  bool
+type model struct {
+	modules     []moduleItem
+	selected    int
+	panel       int
+	target      string
+	targetInput textinput.Model
+	output      []line
+	scroll      int
+	help        bool
+	running     bool
+	status      string
+	width       int
+	height      int
+	banner      []string
+
 	cancel   context.CancelFunc
 	lastMod  string
 	lastOpts modules.Options
-
-	termW, termH int
+	program  *tea.Program
 }
 
-// Run starts the interactive UI and blocks until quit.
-func Run(ctx context.Context, initialTarget string) error {
-	t := &TUI{panel: 0, target: initialTarget}
-	if err := t.rawOn(); err != nil {
-		return err
+type doneMsg struct{}
+
+type outputMsg struct {
+	lvl scanner.Level
+	msg string
+}
+
+type statusMsg string
+
+type errMsg struct {
+	err error
+}
+
+func initialModel(initialTarget string) model {
+	ti := textinput.New()
+	ti.Placeholder = "http://target or host:port"
+	ti.Width = 60
+	ti.SetValue(initialTarget)
+	ti.Focus()
+
+	var mods []moduleItem
+	for _, m := range modules.Registry {
+		mods = append(mods, moduleItem{name: m.Name, desc: m.Desc})
 	}
-	defer t.rawOff()
-	t.render(true)
 
-	in := make(chan rune, 64)
-	errCh := make(chan error, 1)
-	go t.reader(in, errCh)
-
-	emit := func(l scanner.Level, msg string) { t.append(l, msg) }
-
-	for {
-		select {
-		case <-ctx.Done():
-			if t.cancel != nil {
-				t.cancel()
-			}
-			t.statusLine("bye")
-			return nil
-		case err := <-errCh:
-			t.statusLine("input error: " + err.Error())
-			return err
-		case r := <-in:
-			if t.handleKey(r, emit) {
-				return nil
-			}
-		}
+	return model{
+		modules:     mods,
+		panel:       0,
+		target:      initialTarget,
+		targetInput: ti,
+		banner:      getBanner(),
+		status:      "ready",
+		width:       80,
+		height:      24,
 	}
 }
 
-func (t *TUI) append(l scanner.Level, msg string) {
-	t.mu.Lock()
-	t.lines = append(t.lines, line{l, msg})
-	if len(t.lines) > 5000 {
-		t.lines = t.lines[len(t.lines)-5000:]
-	}
-	if t.panel != 1 {
-		t.scrl = 0 // keep auto-scroll unless user is browsing output
-	}
-	t.mu.Unlock()
-	t.render(false)
+func (m *model) Init() tea.Cmd {
+	return textinput.Blink
 }
 
-// handleKey returns true when the UI should quit.
-func (t *TUI) handleKey(r rune, emit scanner.Emit) bool {
-	if r == 0 {
-		return false
-	}
-	if t.help {
-		switch r {
-		case 'h', 'q', 27, 'x':
-			t.help = false
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+		m.targetInput.Width = msg.Width - 20
+		if m.targetInput.Width < 20 {
+			m.targetInput.Width = 20
 		}
-		t.render(true)
-		return false
-	}
-	switch r {
-	case 'q':
-		if !t.runningNow() {
-			return true
-		}
-		if t.cancel != nil {
-			t.cancel()
-		}
-	case 3: // Ctrl+C
-		if t.runningNow() {
-			if t.cancel != nil {
-				t.cancel()
+		return m, nil
+
+	case tea.KeyMsg:
+		// Let textinput handle keys when focused
+		if m.panel == 2 && m.targetInput.Focused() {
+			var cmd tea.Cmd
+			m.targetInput, cmd = m.targetInput.Update(msg)
+			m.target = m.targetInput.Value()
+			if msg.String() == "enter" {
+				m.runSelected()
+				return m, cmd
 			}
+			if msg.String() == "tab" {
+				m.panel = (m.panel + 1) % 3
+				if m.panel == 2 {
+					m.targetInput.Focus()
+				} else {
+					m.targetInput.Blur()
+				}
+				m.scroll = 0
+				return m, cmd
+			}
+			return m, cmd
+		}
+		return m.handleKey(msg), nil
+
+	case outputMsg:
+		m.output = append(m.output, line{lvl: msg.lvl, msg: msg.msg})
+		if len(m.output) > 5000 {
+			m.output = m.output[len(m.output)-5000:]
+		}
+		if m.panel != 1 {
+			m.scroll = 0
+		}
+		return m, nil
+
+	case statusMsg:
+		m.status = string(msg)
+		return m, nil
+
+	case errMsg:
+		m.status = "error: " + msg.err.Error()
+		m.running = false
+		m.cancel = nil
+		return m, nil
+
+	case doneMsg:
+		m.running = false
+		m.cancel = nil
+		return m, nil
+	}
+
+	return m, nil
+}
+
+func (m *model) handleKey(msg tea.KeyMsg) tea.Model {
+	if m.help {
+		if msg.String() == "h" || msg.String() == "q" || msg.String() == "esc" {
+			m.help = false
+			return m
+		}
+		return m
+	}
+
+	switch msg.String() {
+	case "q":
+		if !m.running {
+			return m
+		}
+		if m.cancel != nil {
+			m.cancel()
+		}
+		m.status = "cancelling..."
+	case "ctrl+c":
+		if m.running {
+			if m.cancel != nil {
+				m.cancel()
+			}
+			m.status = "cancelling..."
 		} else {
-			return true
+			return m
 		}
-	case 27: // Esc: cancel running scan
-		if t.runningNow() && t.cancel != nil {
-			t.cancel()
+	case "esc":
+		if m.running && m.cancel != nil {
+			m.cancel()
+			m.status = "cancelling..."
 		}
-	case '\t':
-		t.setPanel((t.panel + 1) % 3)
-		t.scrl = 0
-		t.render(true)
-	case '\n', '\r':
-		t.runSelected(emit)
-	case 's':
-		t.saveReport()
-	case 'h':
-		t.help = true
-		t.render(true)
-	case 'r':
-		if t.lastMod != "" && !t.runningNow() {
-			t.runModule(t.lastMod, t.lastOpts, emit)
+	case "tab":
+		m.panel = (m.panel + 1) % 3
+		if m.panel == 2 {
+			m.targetInput.Focus()
+		} else {
+			m.targetInput.Blur()
 		}
-	case 127, 8: // backspace
-		if t.panel == 2 && t.curPos > 0 {
-			t.target = t.target[:t.curPos-1] + t.target[t.curPos:]
-			t.curPos--
-			t.render(true)
+		m.scroll = 0
+	case "enter":
+		if m.panel == 2 {
+			m.runSelected()
+		} else {
+			m.runSelected()
 		}
-	case 0x15: // Ctrl+U clear input
-		if t.panel == 2 {
-			t.target = ""
-			t.curPos = 0
-			t.render(true)
+	case "s":
+		m.saveReport()
+	case "h":
+		m.help = true
+	case "r":
+		if m.lastMod != "" && !m.running {
+			m.runModule(m.lastMod, m.lastOpts)
 		}
-	case 1: // Ctrl+A home
-		t.curPos = 0
-		t.render(true)
-	case 5: // Ctrl+E end
-		t.curPos = len(t.target)
-		t.render(true)
-	case keyUp, keyDown, keyLeft, keyRight:
-		switch t.panel {
-		case 0:
-			if r == keyUp {
-				t.moveSel(-1)
-			} else if r == keyDown {
-				t.moveSel(1)
-			}
-		case 1:
-			if r == keyUp {
-				t.scroll(-1)
-			} else if r == keyDown {
-				t.scroll(1)
-			}
-		case 2:
-			switch r {
-			case keyLeft:
-				if t.curPos > 0 {
-					t.curPos--
-					t.render(true)
-				}
-			case keyRight:
-				if t.curPos < len(t.target) {
-					t.curPos++
-					t.render(true)
-				}
-			}
+	case "k":
+		if m.panel == 0 && m.selected > 0 {
+			m.selected--
+		} else if m.panel == 1 {
+			m.scroll--
 		}
-	default:
-		switch t.panel {
-		case 0:
-			switch r {
-			case 'k':
-				t.moveSel(-1)
-			case 'j':
-				t.moveSel(1)
+	case "j":
+		if m.panel == 0 && m.selected < len(m.modules)-1 {
+			m.selected++
+		} else if m.panel == 1 {
+			m.scroll++
+		}
+	case "up":
+		if m.panel == 0 {
+			if m.selected > 0 {
+				m.selected--
 			}
-		case 1:
-			switch r {
-			case 'k':
-				t.scroll(-1)
-			case 'j':
-				t.scroll(1)
+		} else if m.panel == 1 {
+			m.scroll--
+		}
+	case "down":
+		if m.panel == 0 {
+			if m.selected < len(m.modules)-1 {
+				m.selected++
 			}
-		case 2:
-			if r >= 32 && r < 127 {
-				t.target = t.target[:t.curPos] + string(r) + t.target[t.curPos:]
-				t.curPos++
-				t.render(true)
-			}
+		} else if m.panel == 1 {
+			m.scroll++
+		}
+	case "ctrl+u":
+		if m.panel == 2 {
+			m.targetInput.SetValue("")
+			m.target = ""
+		}
+	case "ctrl+a":
+		if m.panel == 2 {
+			m.targetInput.CursorStart()
+		}
+	case "ctrl+e":
+		if m.panel == 2 {
+			m.targetInput.CursorEnd()
 		}
 	}
-	return false
-}
 
-func (t *TUI) runningNow() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.running
-}
-
-func (t *TUI) setPanel(p int) {
-	t.mu.Lock()
-	t.panel = p
-	t.mu.Unlock()
-}
-
-func (t *TUI) moveSel(d int) {
-	n := len(modules.Registry)
-	t.sel = (t.sel + d + n) % n
-	t.render(true)
-}
-
-func (t *TUI) scroll(d int) {
-	t.mu.Lock()
-	lines := len(t.lines)
-	t.mu.Unlock()
-	t.scrl += d
-	max := lines - t.panelH()
-	if max < 0 {
-		max = 0
+	if m.scroll < 0 {
+		m.scroll = 0
 	}
-	if t.scrl < 0 {
-		t.scrl = 0
-	}
-	if t.scrl > max {
-		t.scrl = max
-	}
-	t.render(true)
+	m.target = m.targetInput.Value()
+	return m
 }
 
-func (t *TUI) runSelected(emit scanner.Emit) {
-	if t.runningNow() {
-		t.statusLine("scan already running — press Esc to cancel")
+func (m *model) runSelected() {
+	if m.running {
+		m.status = "scan already running — press Esc to cancel"
 		return
 	}
-	mod := modules.Registry[t.sel]
-	target := strings.TrimSpace(t.target)
-	if mod.NeedsTarget && target == "" {
-		t.statusLine("enter a target first (e.g. http://127.0.0.1:8080)")
-		t.panel = 2
-		t.render(true)
+	if m.selected < 0 || m.selected >= len(m.modules) {
 		return
 	}
-	t.runModule(mod.Name, modules.Options{}, emit)
+	mod := m.modules[m.selected]
+	target := strings.TrimSpace(m.target)
+	modObj := modules.ByName(mod.name)
+	if modObj == nil {
+		return
+	}
+	if modObj.NeedsTarget && target == "" {
+		m.status = "enter a target first"
+		m.panel = 2
+		return
+	}
+	m.runModule(mod.name, modules.Options{})
 }
 
-func (t *TUI) runModule(name string, opts modules.Options, emit scanner.Emit) {
+func (m *model) runModule(name string, opts modules.Options) {
 	mod := modules.ByName(name)
 	if mod == nil {
 		return
 	}
-	target := strings.TrimSpace(t.target)
+	target := strings.TrimSpace(m.target)
 	if mod.NeedsTarget && target == "" {
-		t.statusLine("no target set")
+		m.status = "no target set"
 		return
 	}
+
 	ctx, cancel := context.WithCancel(context.Background())
-	t.cancel = cancel
-	t.running = true
-	t.lastMod = name
-	t.lastOpts = opts
-	t.statusLine("running " + name + " ... (Esc to cancel)")
-	t.append(scanner.LHl, "── hacklith: "+name+" ─────────────────────────────")
+	m.cancel = cancel
+	m.running = true
+	m.lastMod = name
+	m.lastOpts = opts
+	m.status = "running " + name + " ... (Esc to cancel)"
+	m.output = append(m.output, line{lvl: scanner.LHl, msg: "── " + name + " ─────────────────────────────"})
 
 	go func() {
+		start := time.Now()
+		emit := func(l scanner.Level, msg string) {
+			if m.program != nil {
+				m.program.Send(outputMsg{lvl: l, msg: msg})
+			}
+		}
 		err := mod.Run(ctx, target, opts, emit)
-		t.mu.Lock()
-		t.running = false
-		t.cancel = nil
-		t.mu.Unlock()
 		if err != nil {
 			emit(scanner.LCrit, "module error: "+err.Error())
 		}
-		t.statusLine("done: " + name + "   [s] save report  [r] rerun")
-		t.render(true)
+		elapsed := time.Since(start).Round(time.Millisecond)
+		if m.program != nil {
+			m.program.Send(statusMsg("done: " + name + "   [s] save report  [r] rerun"))
+			m.program.Send(outputMsg{lvl: scanner.LDim, msg: "finished in " + elapsed.String()})
+			m.program.Send(doneMsg{})
+		}
 	}()
 }
 
-// ---- raw terminal helpers ----
-
-func (t *TUI) rawOn() error {
-	fd := int(os.Stdin.Fd())
-	term, err := tcGet(fd)
+func (m *model) saveReport() {
+	dir := "reports"
+	_ = os.MkdirAll(dir, 0o755)
+	fname := fmt.Sprintf("%s/hacklith_%s.txt", dir, time.Now().Format("20060102_150405"))
+	f, err := os.Create(fname)
 	if err != nil {
-		return err
-	}
-	raw := *term
-	raw.Iflag &^= syscall.IGNBRK | syscall.BRKINT | syscall.PARMRK | syscall.ISTRIP |
-		syscall.INLCR | syscall.IGNCR | syscall.ICRNL | syscall.IXON
-	raw.Oflag &^= syscall.OPOST
-	raw.Lflag &^= syscall.ECHO | syscall.ECHONL | syscall.ICANON | syscall.ISIG | syscall.IEXTEN
-	raw.Cflag &^= syscall.CSIZE | syscall.PARENB
-	raw.Cflag |= syscall.CS8
-	raw.Cc[syscall.VMIN] = 1
-	raw.Cc[syscall.VTIME] = 0
-	if err := tcSet(fd, &raw); err != nil {
-		return err
-	}
-	fmt.Fprint(os.Stdout, altOn+hideCur)
-	return nil
-}
-
-func (t *TUI) rawOff() {
-	fmt.Fprint(os.Stdout, showCur+altOff)
-}
-
-func tcGet(fd int) (*syscall.Termios, error) {
-	var term syscall.Termios
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(syscall.TCGETS), uintptr(unsafe.Pointer(&term)))
-	if errno != 0 {
-		return nil, errno
-	}
-	return &term, nil
-}
-
-func tcSet(fd int, term *syscall.Termios) error {
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(fd), uintptr(syscall.TCSETS), uintptr(unsafe.Pointer(term)))
-	if errno != 0 {
-		return errno
-	}
-	return nil
-}
-
-type winsize struct{ Row, Col, X, Y uint16 }
-
-func termSize() (w, h int) {
-	var ws winsize
-	_, _, errno := syscall.Syscall(syscall.SYS_IOCTL, uintptr(os.Stdout.Fd()), uintptr(syscall.TIOCGWINSZ), uintptr(unsafe.Pointer(&ws)))
-	if errno != 0 {
-		return 80, 24
-	}
-	if ws.Col == 0 || ws.Row == 0 {
-		return 80, 24
-	}
-	return int(ws.Col), int(ws.Row)
-}
-
-// reader decodes single bytes, arrow keys and escape sequences.
-func (t *TUI) reader(ch chan<- rune, errCh chan<- error) {
-	buf := make([]byte, 1)
-	for {
-		n, err := os.Stdin.Read(buf)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		if n == 0 {
-			continue
-		}
-		b := buf[0]
-		if b != 0x1b {
-			ch <- rune(b)
-			continue
-		}
-		// ESC: distinguish lone Esc from arrow keys via 50ms timeout.
-		t.setReadTimeout(50)
-		n, err = os.Stdin.Read(buf)
-		t.setReadTimeout(0)
-		if err != nil || n == 0 {
-			ch <- 27 // lone Esc
-			continue
-		}
-		if buf[0] == '[' {
-			n, err = os.Stdin.Read(buf)
-			if err != nil || n == 0 {
-				ch <- 27
-				continue
-			}
-			switch buf[0] {
-			case 'A':
-				ch <- keyUp
-			case 'B':
-				ch <- keyDown
-			case 'C':
-				ch <- keyRight
-			case 'D':
-				ch <- keyLeft
-			default:
-				ch <- 27
-			}
-			continue
-		}
-		ch <- 27 // unknown escape
-	}
-}
-
-func (t *TUI) setReadTimeout(ms int) {
-	fd := int(os.Stdin.Fd())
-	term, err := tcGet(fd)
-	if err != nil {
+		m.status = "save failed: " + err.Error()
 		return
 	}
-	if ms > 0 {
-		term.Cc[syscall.VMIN] = 0
-		term.Cc[syscall.VTIME] = uint8((ms + 99) / 100)
-	} else {
-		term.Cc[syscall.VMIN] = 1
-		term.Cc[syscall.VTIME] = 0
+	defer f.Close()
+	for _, l := range m.output {
+		fmt.Fprintf(f, "%s %s\n", cli.Tag(l.lvl), l.msg)
 	}
-	_ = tcSet(fd, term)
+	m.status = "report saved: " + fname
 }
 
-// ---- rendering ----
-
-func (t *TUI) render(force bool) {
-	w, h := termSize()
-	if w != t.termW || h != t.termH {
-		t.termW, t.termH = w, h
-		force = true
+func (m *model) View() string {
+	w := m.width
+	h := m.height
+	if w < 1 {
+		w = 80
 	}
-	if !force {
-		return
+	if h < 1 {
+		h = 24
 	}
-	t.mu.Lock()
-	defer t.mu.Unlock()
 
 	var sb strings.Builder
-	sb.WriteString(home + cls)
-	banner := bannerLines()
-	// ANSI drop shadow: dark copy at +1,+1, bright copy on top.
-	for i, bl := range banner {
-		sb.WriteString(moveTo(2, 2+i))
-		sb.WriteString(cli.CDim + bl + cli.CReset)
-	}
-	for i, bl := range banner {
-		sb.WriteString(moveTo(1, 1+i))
-		sb.WriteString(cli.CGreen + bl + cli.CReset)
-	}
-	top := len(banner) + 1
 
-	// left panel: module list
+	banner := getBanner()
+	for i, bl := range banner {
+		if i < h-3 {
+			sb.WriteString(bannerStyle.Render(bl) + "\n")
+		}
+	}
+
+	top := len(banner) + 1
+	if top > h-3 {
+		top = h - 3
+	}
+
 	pw := 30
 	if w < 80 {
 		pw = 20
@@ -477,160 +408,80 @@ func (t *TUI) render(force bool) {
 	if ph < 3 {
 		ph = 3
 	}
-	right := top
-	sb.WriteString(moveTo(1, right))
-	sb.WriteString(rev + pad("MODULES", pw) + cli.CReset)
+
+	var modList strings.Builder
+	modList.WriteString(lipgloss.NewStyle().Reverse(true).Render(" MODULES ") + "\n")
 	for i := 0; i < ph; i++ {
-		mi := i
-		row := right + 1 + i
-		sb.WriteString(moveTo(1, row))
-		if mi < len(modules.Registry) {
-			m := modules.Registry[mi]
-			name := m.Name
-			if t.panel == 0 && mi == t.sel {
-				sb.WriteString(rev + " " + padRight(name, pw-2) + " " + cli.CReset)
-			} else {
-				desc := m.Desc
-				avail := pw - len(name) - 1
-				if avail < 0 {
-					avail = 0
-				}
-				sb.WriteString(cli.CReset + name + cli.CDim + " " + truncW(desc, avail) + cli.CReset)
-			}
+		if i >= len(m.modules) {
+			modList.WriteString(strings.Repeat(" ", pw) + "\n")
+			continue
+		}
+		mod := m.modules[i]
+		if m.panel == 0 && i == m.selected {
+			modList.WriteString(selectedStyle.Render("> " + mod.name + " " + truncate(mod.desc, pw-len(mod.name)-3)) + "\n")
 		} else {
-			sb.WriteString(strings.Repeat(" ", pw))
+			modList.WriteString(moduleStyle.Render("  " + mod.name + " " + truncate(mod.desc, pw-len(mod.name)-3)) + "\n")
 		}
 	}
 
-	// right panel: output
 	ow := w - pw - 1
 	if ow < 10 {
 		ow = 10
 	}
-	ox := pw + 1
-	sb.WriteString(moveTo(ox, right))
-	title := "OUTPUT"
-	if t.running {
-		title += "  (running...)"
-	}
-	sb.WriteString(rev + pad(title, ow) + cli.CReset)
-	disp := t.outputLines(ph, ow)
-	for i, d := range disp {
-		sb.WriteString(moveTo(ox, right+1+i))
-		sb.WriteString(padW(d, ow) + cli.CReset)
+	var outList strings.Builder
+	outList.WriteString(lipgloss.NewStyle().Reverse(true).Render(" OUTPUT ") + "\n")
+	lines := m.output
+	if len(lines) == 0 {
+		outList.WriteString(cli.CDim + "no output yet — select a module and press Enter" + cli.CReset + "\n")
+	} else {
+		start := len(lines) - ph - m.scroll
+		if start < 0 {
+			start = 0
+		}
+		for i := start; i < len(lines) && i-start < ph; i++ {
+			l := lines[i]
+			outList.WriteString(cli.Color(l.lvl) + cli.Tag(l.lvl) + " " + truncate(l.msg, ow-6) + cli.CReset + "\n")
+		}
+		for i := len(lines) - start; i < ph && i >= 0; i++ {
+			outList.WriteString("\n")
+		}
 	}
 
-	// bottom bar: target input / status / hints
-	by := h
-	sb.WriteString(moveTo(1, by))
-	label := "TARGET"
-	val := t.target
-	if t.curPos > len(val) {
-		t.curPos = len(val)
-	}
-	// render target field with reversed style when focused
+	left := modList.String()
+	right := outList.String()
+	combined := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
+	sb.WriteString(combined)
+
+	sb.WriteString("\n")
 	fieldW := w - 30
 	if fieldW < 20 {
 		fieldW = 20
 	}
-	field := padRight(val, fieldW)
-	if t.panel == 2 {
-		sb.WriteString(rev + label + " " + field + cli.CReset)
+	targetVal := m.target
+	if len(targetVal) > fieldW {
+		targetVal = targetVal[:fieldW-3] + "..."
+	}
+	field := targetVal + strings.Repeat(" ", fieldW-len(targetVal))
+	if m.panel == 2 {
+		sb.WriteString(targetStyle.Render("TARGET ") + lipgloss.NewStyle().Reverse(true).Render(field))
 	} else {
-		sb.WriteString(cli.CBold + label + cli.CReset + " " + field)
+		sb.WriteString(targetStyle.Render("TARGET ") + field)
 	}
-	// status + hints on the same row, right-aligned
-	status := "ready"
-	if t.running {
-		status = "RUNNING (Esc=cancel)"
-	}
+
+	status := m.status
 	hints := "[Tab]panels [Enter]run [s]save [h]help [q]quit"
-	rightBar := " " + status + "  " + hints
-	sb.WriteString(cli.CDim + rightBar + cli.CReset)
+	sb.WriteString(" " + statusStyle.Render(" "+status+"  "+hints))
 
-	// cursor placement
-	cx := 8 + t.curPos
-	if t.panel == 2 {
-		sb.WriteString(moveTo(cx, h) + showCur)
-	} else {
-		sb.WriteString(moveTo(1, h) + hideCur)
+	if m.help {
+		sb.WriteString("\n" + m.helpOverlay())
 	}
 
-	if t.help {
-		sb.WriteString(t.helpOverlay())
-	}
-	fmt.Fprint(os.Stdout, sb.String())
-	t.rendered = true
+	return sb.String()
 }
 
-func (t *TUI) outputLines(ph, ow int) []string {
-	if len(t.lines) == 0 {
-		return []string{cli.CDim + "no output yet — select a module and press Enter" + cli.CReset}
-	}
-	max := len(t.lines) - ph
-	if max < 0 {
-		max = 0
-	}
-	start := len(t.lines) - ph - t.scrl
-	if start < 0 {
-		start = 0
-	}
-	var out []string
-	for i := start; i < len(t.lines) && len(out) < ph; i++ {
-		l := t.lines[i]
-		msg := wrapW(l.msg, ow)
-		for j, m := range msg {
-			if len(out) >= ph {
-				break
-			}
-			colored := cli.Color(l.lvl) + cli.Tag(l.lvl) + " " + m + cli.CReset
-			if j > 0 {
-				colored = cli.CReset + "     " + m + cli.CReset
-			}
-			out = append(out, colored)
-		}
-	}
-	if len(out) < ph {
-		for len(out) < ph {
-			out = append(out, "")
-		}
-	}
-	return out
-}
-
-func (t *TUI) panelH() int {
-	w, h := termSize()
-	_ = w
-	banner := 6
-	return h - banner - 4
-}
-
-func (t *TUI) statusLine(s string) {
-	t.append(scanner.LDim, s)
-}
-
-func (t *TUI) saveReport() {
-	dir := "reports"
-	_ = os.MkdirAll(dir, 0o755)
-	fname := fmt.Sprintf("%s/hacklith_%s.txt", dir, time.Now().Format("20060102_150405"))
-	f, err := os.Create(fname)
-	if err != nil {
-		t.statusLine("save failed: " + err.Error())
-		return
-	}
-	defer f.Close()
-	t.mu.Lock()
-	for _, l := range t.lines {
-		fmt.Fprintf(f, "%s %s\n", cli.Tag(l.lvl), l.msg)
-	}
-	t.mu.Unlock()
-	t.statusLine("report saved: " + fname)
-	t.render(true)
-}
-
-func (t *TUI) helpOverlay() string {
+func (m *model) helpOverlay() string {
 	lines := []string{
-		" HACKQUAD KEYS",
+		" HACKLITH KEYS",
 		"",
 		"  Tab         cycle panels (modules / output / target)",
 		"  Up/Down     move selection or scroll output",
@@ -646,122 +497,50 @@ func (t *TUI) helpOverlay() string {
 		"",
 		"  Authorized use only.",
 	}
-	w, h := termSize()
+	w := m.width
+	if w < 1 {
+		w = 80
+	}
 	bw := 46
 	startX := (w - bw) / 2
-	startY := (h - len(lines)) / 2
 	if startX < 1 {
 		startX = 1
 	}
-	if startY < 1 {
-		startY = 1
-	}
 	var sb strings.Builder
-	for i, l := range lines {
-		sb.WriteString(moveTo(startX, startY+i))
-		sb.WriteString("\x1b[44m" + padW(l, bw) + cli.CReset)
+	for _, l := range lines {
+		sb.WriteString(strings.Repeat(" ", startX) + lipgloss.NewStyle().Background(lipgloss.Color("4")).Render(truncate(l, bw)) + "\n")
 	}
 	return sb.String()
 }
 
-func moveTo(x, y int) string {
-	return fmt.Sprintf("\x1b[%d;%dH", y, x)
-}
-
-func pad(s string, w int) string {
-	if len(s) >= w {
-		return s[:w]
-	}
-	return s + strings.Repeat(" ", w-len(s))
-}
-
-func padRight(s string, w int) string {
-	return pad(s, w)
-}
-
-func padW(s string, w int) string {
-	clean := stripANSI(s)
-	if len(clean) >= w {
-		return s
-	}
-	return s + strings.Repeat(" ", w-len(clean))
-}
-
-func stripANSI(s string) string {
-	var sb strings.Builder
-	in := false
-	for _, r := range s {
-		if r == '\x1b' {
-			in = true
-			continue
-		}
-		if in {
-			if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' {
-				in = false
-			}
-			continue
-		}
-		sb.WriteRune(r)
-	}
-	return sb.String()
-}
-
-func truncW(s string, w int) string {
-	if w < 1 {
+func truncate(s string, n int) string {
+	if n < 1 {
 		return ""
 	}
-	if len(s) <= w {
+	if len(s) <= n {
 		return s
 	}
-	if w <= 3 {
-		return s[:w]
+	if n <= 3 {
+		return s[:n]
 	}
-	return s[:w-3] + "..."
+	return s[:n-3] + "..."
 }
 
-func wrapW(s string, w int) []string {
-	if w < 1 {
-		w = 1
-	}
-	if len(s) <= w {
-		return []string{s}
-	}
-	var out []string
-	for len(s) > w {
-		out = append(out, s[:w])
-		s = s[w:]
-	}
-	out = append(out, s)
-	return out
-}
+func Run(ctx context.Context, initialTarget string) error {
+	m := initialModel(initialTarget)
+	p := tea.NewProgram(&m, tea.WithAltScreen())
+	m.program = p
 
-// bannerLines renders the 6-line HACKLITH block banner.
-func bannerLines() []string {
-	glyphs := map[rune][]string{
-		'H': {"H   H", "H   H", "HHHHH", "H   H", "H   H", "H   H"},
-		'A': {" AAA ", "A   A", "AAAAA", "A   A", "A   A", "A   A"},
-		'C': {" CCCC", "C    ", "C    ", "C    ", "C    ", " CCCC"},
-		'K': {"K  K ", "K K  ", "KK   ", "K K  ", "K  K ", "K  K "},
-		'L': {"L    ", "L    ", "L    ", "L    ", "L    ", "LLLLL"},
-		'I': {"  I  ", "  I  ", "  I  ", "  I  ", "  I  ", "  I  "},
-		'T': {"TTTTT", "  T  ", "  T  ", "  T  ", "  T  ", "  T  "},
-	}
-	word := "HACKLITH"
-	var rows [6]string
-	for i := 0; i < 6; i++ {
-		var sb strings.Builder
-		for _, ch := range word {
-			g, ok := glyphs[ch]
-			if !ok {
-				continue
-			}
-			sb.WriteString(g[i])
-			sb.WriteString(" ")
+	go func() {
+		<-ctx.Done()
+		if m.cancel != nil {
+			m.cancel()
 		}
-		rows[i] = sb.String()
+		p.Quit()
+	}()
+
+	if _, err := p.Run(); err != nil {
+		return err
 	}
-	return rows[:]
+	return nil
 }
-
-
-
